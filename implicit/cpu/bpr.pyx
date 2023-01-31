@@ -20,6 +20,7 @@ import random
 
 import numpy as np
 import scipy.sparse
+from scipy.sparse import csr_matrix
 
 from libcpp.vector cimport vector
 
@@ -85,6 +86,10 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         The learning rate to apply for SGD updates during training
     regularization : float, optional
         The regularization factor to use
+    pop_regularization: float, optional
+        The degree of popularity regularization to use to adapt the item embeddings
+    short_head_quantile: float, optional
+        The quantile of most popular items used for splitting into two groups for fairness regularization
     dtype : data-type, optional
         Specifies whether to generate 64 bit or 32 bit floating point factors
     iterations : int, optional
@@ -107,18 +112,47 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
     user_factors : ndarray
         Array of latent factors for each user in the training set
     """
-    def __init__(self, factors=100, learning_rate=0.01, regularization=0.01, dtype=np.float32,
+    def __init__(self, factors=100, learning_rate=0.01, regularization=0.01,
+                 pop_regularization=1e-5, short_head_quantile=0.2, dtype=np.float32,
                  iterations=100, num_threads=0,
                  verify_negative_samples=True, random_state=None):
         super(BayesianPersonalizedRanking, self).__init__(num_threads=num_threads)
+
+        assert 0 <= short_head_quantile <= 1
 
         self.factors = factors
         self.learning_rate = learning_rate
         self.iterations = iterations
         self.regularization = regularization
+        self.pop_regularization = pop_regularization
+        self.short_head_quantile = short_head_quantile
         self.dtype = np.dtype(dtype)
         self.verify_negative_samples = verify_negative_samples
         self.random_state = random_state
+
+        self.short_head_items = None
+        self.medium_tail_items = None
+        self.l_d = None
+
+    def fairness_split(self, user_items):
+        m, n = user_items.shape
+        item_counts = user_items.getnnz(axis=0)
+        count_quantile = np.quantile(item_counts, 1 - self.short_head_quantile)
+        short_head_items = np.where(item_counts >= count_quantile)[0]
+        medium_tail_items = np.setdiff1d(np.arange(len(item_counts)), short_head_items)
+
+        short = np.array(np.meshgrid(short_head_items, short_head_items)).T.reshape(-1, 2)
+        short_d = csr_matrix((np.ones(len(short)), (short[:, 0], short[:, 1])), shape=(n, n))
+        long = np.array(np.meshgrid(medium_tail_items, medium_tail_items)).T.reshape(-1, 2)
+        long_d = csr_matrix((np.ones(len(long)), (long[:, 0], long[:, 1])), shape=(n, n))
+        d = short_d + long_d
+        e = np.eye(n)
+        np.fill_diagonal(e, d.sum(axis=1).flatten())
+        e = csr_matrix(e)
+
+        self.l_d = (e-d).diagonal().astype(np.float32)
+        self.short_head_items = set(short_head_items)
+        self.medium_tail_items = set(medium_tail_items)
 
     @cython.cdivision(True)
     @cython.boundscheck(False)
@@ -138,6 +172,8 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
             Callable function on each epoch with such arguments as epoch, elapsed time and progress
         """
         rs = check_random_state(self.random_state)
+
+        self.fairness_split(user_items)
 
         # for now, all we handle is float 32 values
         if user_items.dtype != np.float32:
@@ -159,21 +195,21 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         # Note: the final dimension is for the item bias term - which is set to a 1 for all users
         # this simplifies interfacing with approximate nearest neighbours libraries etc
         if self.item_factors is None:
-            self.item_factors = (rs.rand(items, self.factors + 1).astype(self.dtype) - .5)
+            self.item_factors = (rs.rand(items, self.factors).astype(self.dtype) - .5)
             self.item_factors /= self.factors
 
             # set factors to all zeros for items without any ratings
             item_counts = np.bincount(user_items.indices, minlength=items)
-            self.item_factors[item_counts == 0] = np.zeros(self.factors + 1)
+            self.item_factors[item_counts == 0] = np.zeros(self.factors)
 
         if self.user_factors is None:
-            self.user_factors = (rs.rand(users, self.factors + 1).astype(self.dtype) - .5)
+            self.user_factors = (rs.rand(users, self.factors).astype(self.dtype) - .5)
             self.user_factors /= self.factors
 
             # set factors to all zeros for users without any ratings
-            self.user_factors[user_counts == 0] = np.zeros(self.factors + 1)
+            self.user_factors[user_counts == 0] = np.zeros(self.factors)
 
-            self.user_factors[:, self.factors] = 1.0
+            # self.user_factors[:, self.factors] = 1.0
 
         # invalidate cached norms
         self._user_norms = self._item_norms = None
@@ -196,7 +232,8 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
                 correct, skipped = bpr_update(rng, userids, user_items.indices, user_items.indptr,
                                               self.user_factors, self.item_factors,
                                               self.learning_rate, self.regularization, num_threads,
-                                              self.verify_negative_samples)
+                                              self.verify_negative_samples, self.l_d,
+                                              self.pop_regularization)
                 progress.update(1)
                 total = len(user_items.data)
                 if total != 0 and total != skipped:
@@ -253,7 +290,7 @@ def bpr_update(RNGVector rng,
                integral[:] userids, integral[:] itemids, integral[:] indptr,
                floating[:, :] X, floating[:, :] Y,
                float learning_rate, float reg, int num_threads,
-               bool verify_neg):
+               bool verify_neg, floating[:] LD, float pop_reg):
     cdef integral users = X.shape[0], items = Y.shape[0]
     cdef long samples = len(userids), i, liked_index, disliked_index, correct = 0, skipped = 0
     cdef integral j, liked_id, disliked_id, thread_id
@@ -285,7 +322,7 @@ def bpr_update(RNGVector rng,
 
             # compute the score
             score = 0
-            for j in range(factors + 1):
+            for j in range(factors):
                 score = score + user[j] * (liked[j] - disliked[j])
             z = 1.0 / (1.0 + exp(score))
 
@@ -296,11 +333,11 @@ def bpr_update(RNGVector rng,
             for j in range(factors):
                 temp = user[j]
                 user[j] += learning_rate * (z * (liked[j] - disliked[j]) - reg * user[j])
-                liked[j] += learning_rate * (z * temp - reg * liked[j])
-                disliked[j] += learning_rate * (-z * temp - reg * disliked[j])
+                liked[j] += learning_rate * (z * temp - reg * liked[j] - LD[liked_id] * liked[j] * pop_reg)
+                disliked[j] += learning_rate * (-z * temp - reg * disliked[j] - LD[disliked_id] * disliked[j] * pop_reg)
 
             # update item bias terms (last column of factorized matrix)
-            liked[factors] += learning_rate * (z - reg * liked[factors])
-            disliked[factors] += learning_rate * (-z - reg * disliked[factors])
+            # liked[factors] += learning_rate * (z - reg * liked[factors])
+            # disliked[factors] += learning_rate * (-z - reg * disliked[factors])
 
     return correct, skipped

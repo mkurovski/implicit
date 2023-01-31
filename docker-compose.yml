@@ -1,0 +1,11 @@
+version: "3.9"
+services:
+  jupyter:
+    build: .
+    ports:
+      - "8892:8888"
+    volumes:
+      - /Users/mkurovski/recsys/implicit:/implicit
+    container_name: implicit
+    stdin_open: true
+    tty: true

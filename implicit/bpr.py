@@ -8,6 +8,8 @@ def BayesianPersonalizedRanking(
     factors=100,
     learning_rate=0.01,
     regularization=0.01,
+    pop_regularization=1e-5,
+    short_head_quantile=0.2,
     dtype=np.float32,
     iterations=100,
     use_gpu=implicit.gpu.HAS_CUDA,
@@ -32,6 +34,10 @@ def BayesianPersonalizedRanking(
         The learning rate to apply for SGD updates during training
     regularization : float, optional
         The regularization factor to use
+    pop_regularization: float, optional
+        The degree of popularity regularization to use to adapt the item embeddings
+    short_head_quantile: float, optional
+        The quantile of most popular items used for splitting into two groups for fairness regularization
     dtype : data-type, optional
         Specifies whether to generate 64 bit or 32 bit floating point factors
     use_gpu : bool, optional
@@ -64,6 +70,8 @@ def BayesianPersonalizedRanking(
         factors,
         learning_rate,
         regularization,
+        pop_regularization,
+        short_head_quantile,
         dtype=dtype,
         num_threads=num_threads,
         iterations=iterations,
