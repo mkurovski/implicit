@@ -113,7 +113,7 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         Array of latent factors for each user in the training set
     """
     def __init__(self, factors=100, learning_rate=0.01, regularization=0.01,
-                 pop_regularization=1e-5, short_head_quantile=0.2, dtype=np.float32,
+                 pop_regularization=0, short_head_quantile=0.2, dtype=np.float32,
                  iterations=100, num_threads=0,
                  verify_negative_samples=True, random_state=None):
         super(BayesianPersonalizedRanking, self).__init__(num_threads=num_threads)
@@ -139,7 +139,7 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         item_counts = user_items.getnnz(axis=0)
         count_quantile = np.quantile(item_counts, 1 - self.short_head_quantile)
         short_head_items = np.where(item_counts >= count_quantile)[0]
-        medium_tail_items = np.setdiff1d(np.arange(len(item_counts)), short_head_items)
+        medium_tail_items = np.setdiff1d(np.arange(n), short_head_items)
 
         short = np.array(np.meshgrid(short_head_items, short_head_items)).T.reshape(-1, 2)
         short_d = csr_matrix((np.ones(len(short)), (short[:, 0], short[:, 1])), shape=(n, n))
@@ -226,6 +226,8 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         cdef RNGVector rng = RNGVector(num_threads, len(user_items.data) - 1, rng_seeds)
 
         log.debug("Running %i BPR training epochs", self.iterations)
+        if self.pop_regularization > 0:
+            log.info(f"Popularity Regularization Active with \lambda = {self.pop_regularization}")
         with tqdm(total=self.iterations, disable=not show_progress) as progress:
             for epoch in range(self.iterations):
                 s = time.time()
